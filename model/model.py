@@ -1,3 +1,6 @@
+import math
+from typing import Optional
+
 from transformers import PretrainedConfig
 
 
@@ -88,3 +91,58 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         return self.scale * self._norm(x.float()).type_as(x)
+
+def precompute_freqs_cis(
+    dim: int,
+    end: int = int(32 * 1024),
+    rope_base: float = 1e4,
+    rope_scaling: Optional[dict] = None,
+):
+    # 初始化 RoPE 频率
+    freqs = 1.0 / (
+        rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)
+    )
+    if rope_scaling is not None:
+        orig_max, factor, beta_fast, beta_slow = (
+            rope_scaling.get("original_max_position_embeddings", 2048),
+            rope_scaling.get("factor", 4),
+            rope_scaling.get("beta_fast", 4.0),
+            rope_scaling.get("beta_slow", 1.0),
+        )
+        if end / orig_max > 1.0:
+            corr_dim = next(
+                (i for i in range(dim // 2) if 2 * math.pi / freqs[i] > orig_max),
+                dim // 2,
+            )
+            power = torch.arange(0, dim // 2, device=freqs.device).float() / max(
+                dim // 2 - 1, 1
+            )
+            beta = beta_slow + (beta_fast - beta_slow) * power
+            # YaRN 缩放公式：λ = (β·α - β + 1) / (β·α)
+            scale = torch.where(
+                torch.arange(dim // 2, device=freqs.device) < corr_dim,
+                (beta * factor - beta + 1) / (beta * factor),
+                1.0 / factor,
+            )
+            freqs = freqs * scale
+
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()
+    freqs_cos = torch.cos(freqs).repeat_interleave(2, dim=-1)  # [seq_len, dim]
+    freqs_sin = torch.sin(freqs).repeat_interleave(2, dim=-1)  # [seq_len, dim]
+    return freqs_cos, freqs_sin
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    def rotate_half(x: torch.Tensor):
+        """把相邻两维看成 (x1, x2)，旋转为 (-x2, x1)。"""
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        return torch.stack([-x2, x1], dim=-1).flatten(-2)
+
+    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
+    )
+    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (
+        rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
+    )
+    return q_embed, k_embed
