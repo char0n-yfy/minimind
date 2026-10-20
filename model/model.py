@@ -74,23 +74,26 @@ class MokioMindConfig(PretrainedConfig):
             else None
         )
 
+
 import torch
 from torch import nn
 
 # 继承 nn.Module 类
 
+
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float=1e-8):
+    def __init__(self, dim: int, eps: float = 1e-8):
         super().__init__()
         self.dim = dim
         self.eps = eps
         self.scale = nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x): 
-        return torch.rsqrt(x.pow(2).mean(-1, keepdim = True) + self.eps) * x
+    def _norm(self, x):
+        return torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * x
 
     def forward(self, x):
         return self.scale * self._norm(x.float()).type_as(x)
+
 
 def precompute_freqs_cis(
     dim: int,
@@ -99,9 +102,7 @@ def precompute_freqs_cis(
     rope_scaling: Optional[dict] = None,
 ):
     # 初始化 RoPE 频率
-    freqs = 1.0 / (
-        rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)
-    )
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     if rope_scaling is not None:
         orig_max, factor, beta_fast, beta_slow = (
             rope_scaling.get("original_max_position_embeddings", 2048),
@@ -146,3 +147,61 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
         rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
     )
     return q_embed, k_embed
+
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    bs, slen, num_key_value_heads, head_dim = x.shape  # 把输入张量的维度取出来
+    # bs: Batch size
+    # slen: sequence length
+    # num_key_value_heads: K 或 V 的注意力头数量 这里为 2
+    # head_dim: 每个头在每个 token 位置上的向量长度，通常为 hidden_size // num_attention_heads，你的默认配置是 512 // 8 = 64
+    if n_rep == 1:
+        return x
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
+        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+    )
+
+
+class Attention(nn.Module):
+    def __init__(self, args: MokioMindConfig):
+        super().__init__()
+
+        self.n_local_heads = args.num_attention_heads
+        self.num_key_value_heads = (
+            args.num_attention_heads
+            if args.num_key_value_heads is None
+            else args.num_key_value_heads
+        )
+
+        assert self.n_local_heads % self.num_key_value_heads == 0, (
+            "num_attention_heads must be divisible by num_key_value_heads"
+        )
+        assert args.hidden_size % self.n_local_heads == 0, (
+            "hidden_size must be divisible by num_attention_heads"
+        )
+
+        self.n_rep = self.n_local_heads // self.num_key_value_heads
+        self.head_dim = args.hidden_size // self.n_local_heads
+
+        self.q_proj = nn.Linear(
+            args.hidden_size,
+            self.n_local_heads * self.head_dim,
+            bias=False,
+        )
+        self.k_proj = nn.Linear(
+            args.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=False,
+        )
+        self.v_proj = nn.Linear(
+            args.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=False,
+        )
+        self.o_proj = nn.Linear(
+            self.n_local_heads * self.head_dim,
+            args.hidden_size,
+            bias=False,
+        )
